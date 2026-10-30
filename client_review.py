@@ -19,6 +19,7 @@ from pathlib import Path
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Script review", page_icon=":memo:", layout="centered", initial_sidebar_state="collapsed")
 st.markdown("<style>#MainMenu, footer, [data-testid='stToolbar'] {visibility: hidden;}</style>", unsafe_allow_html=True)
@@ -28,7 +29,61 @@ SAFE = re.compile(r"[A-Za-z0-9_-]{1,60}")
 VERDICTS = {"good": "Good to go", "change": "Change it", "drop": "Don't make this video"}
 WHY = [("Angle", "angle"), ("Who it speaks to", "audience"), ("Our bet", "bet"), ("Why we think so", "evidence"),
        ("Test type", "test_type"), ("What we will learn", "learn")]
-NOTE_MAX, TEXT_MAX, HOOK_MAX = 2000, 6000, 600
+NOTE_MAX, TEXT_MAX, HOOK_MAX = 10000, 6000, 600
+# No max_chars on the text boxes: Streamlit silently drops a paste that would go over it. We check the length instead.
+
+# Voice typing: the browser turns speech into text (Chrome, Edge, Safari). No key, no server of ours.
+# The button fills the text box right above it; Streamlit saves a text box when it loses focus.
+VOICE_HTML = """
+<style>
+ body {margin: 0; font-family: "Source Sans Pro", "Source Sans 3", sans-serif;}
+ button {font: inherit; font-size: 14px; padding: 3px 12px; border-radius: 8px; cursor: pointer;
+         border: 1px solid rgba(128,128,128,.45); background: transparent; color: inherit;}
+ button.on {border-color: #e5484d; color: #e5484d;}
+ button:disabled {cursor: default; opacity: .5;}
+ span {font-size: 13px; opacity: .75; margin-left: 8px;}
+</style>
+<button id="b">🎤 Speak</button><span id="s"></span>
+<script>
+const P = window.parent, b = document.getElementById("b"), s = document.getElementById("s");
+try { document.body.style.color = P.getComputedStyle(P.document.body).color; } catch (e) {}
+const SR = P.SpeechRecognition || P.webkitSpeechRecognition;
+function target() {
+  let last = null;
+  for (const t of P.document.querySelectorAll("textarea, input[type='text']"))
+    if (t.compareDocumentPosition(window.frameElement) & 4) last = t;   // 4: the button comes after this box
+  return last;
+}
+function add(text) {
+  const t = target();
+  if (!t || !text.trim()) return;
+  const proto = P[t.tagName === "TEXTAREA" ? "HTMLTextAreaElement" : "HTMLInputElement"].prototype;
+  t.focus();
+  Object.getOwnPropertyDescriptor(proto, "value").set.call(t, t.value + (t.value && !/\\s$/.test(t.value) ? " " : "") + text.trim());
+  t.dispatchEvent(new P.Event("input", {bubbles: true}));
+  t.blur();
+  t.dispatchEvent(new P.FocusEvent("focusout", {bubbles: true}));   // also when the window has no focus
+}
+let rec = null;
+if (!SR) { b.disabled = true; s.textContent = "Voice typing works in Chrome, Edge and Safari."; }
+b.onclick = () => {
+  if (rec) { rec.stop(); return; }
+  rec = new SR();
+  rec.continuous = true; rec.interimResults = true; rec.lang = P.navigator.language || "en-US";
+  rec.onresult = (e) => {
+    let heard = "";
+    for (let i = e.resultIndex; i < e.results.length; i++)
+      if (e.results[i].isFinal) add(e.results[i][0].transcript); else heard += e.results[i][0].transcript;
+    s.textContent = heard || "Listening… click Stop when you are done.";
+  };
+  rec.onerror = (e) => { s.textContent = e.error === "not-allowed" ? "Allow the microphone for this page, then click Speak again."
+                                        : e.error === "no-speech" ? "I heard nothing. Click Speak and try again." : "Voice typing stopped (" + e.error + ")."; };
+  rec.onend = () => { rec = null; b.textContent = "🎤 Speak"; b.className = ""; if (s.textContent.startsWith("Listening")) s.textContent = ""; };
+  rec.start();
+  b.textContent = "⏹ Stop"; b.className = "on"; s.textContent = "Listening… click Stop when you are done.";
+};
+</script>
+"""
 
 
 # ---------- repo access: only client_review/ ----------
@@ -130,6 +185,19 @@ def when(iso: str | None) -> str:
 
 def rounds(files: list[str]) -> list[int]:
     return sorted(int(m.group(1)) for f in files if (m := re.fullmatch(r"packet_r(\d+)\.json", f)))
+
+
+def voice_button() -> None:
+    """🎤 Speak under the text box above it."""
+    components.html(VOICE_HTML, height=36)
+
+
+def length_check(key: str, limit: int, what: str) -> bool:
+    """Shows an error under a text box that is too long. True when the length is OK."""
+    n = len(st.session_state.get(key) or "")
+    if n > limit:
+        st.error(f"{what}: {n:,} characters. The limit is {limit:,}. Make the text shorter before you save or send.")
+    return n <= limit
 
 
 # ---------- who is this? ----------
@@ -265,7 +333,8 @@ with st.expander("How to review (about 2 minutes per script)", expanded=not fb):
                 "2. Edit the hooks or the body if you want something said differently. Each script has up to 3 "
                 "**hooks**: different openings (the first ~3 seconds) for the same body. We test all of them. "
                 "Empty a hook to drop it.\n"
-                "3. Pick **your verdict** and write **your notes**: what to change, and what you like.\n"
+                "3. Pick **your verdict** and write **your notes**: what to change, and what you like. "
+                "You can paste text, or click **🎤 Speak** under the notes box and say it (Chrome, Edge or Safari).\n"
                 "4. Click **Send feedback** at the bottom. Click **Save draft** to stop and come back later.")
 if fb.get("status") == "draft":
     st.caption(f"Draft saved {when(fb.get('saved_at'))}" + (f" by {fb['name']}" if fb.get("name") else "") + ".")
@@ -277,8 +346,10 @@ for p in pk["scripts"]:
     changes_box(sid)
     st.markdown("**The script** · edit anything you want to change")
     for h in p["hooks"]:
-        st.text_area(f"Hook {h['k']}", key=k_hook(sid, h["k"]), height=68, max_chars=HOOK_MAX)
-    st.text_area("Body (the rest of the voiceover)", key=k_body(sid), height=300, max_chars=TEXT_MAX)
+        st.text_area(f"Hook {h['k']}", key=k_hook(sid, h["k"]), height=68)
+        length_check(k_hook(sid, h["k"]), HOOK_MAX, f"Hook {h['k']}")
+    st.text_area("Body (the rest of the voiceover)", key=k_body(sid), height=300)
+    length_check(k_body(sid), TEXT_MAX, "The body")
     changed = [f"hook {h['k']}" for h in p["hooks"] if st.session_state[k_hook(sid, h["k"])].strip() != h["text"].strip()]
     changed += ["the body"] if st.session_state[k_body(sid)].strip() != p["body"].strip() else []
     if changed:
@@ -286,9 +357,22 @@ for p in pk["scripts"]:
         c1.caption("You changed " + ", ".join(changed) + ".")
         c2.button("Back to our version", key=f"{prefix}{sid}:reset", on_click=back_to_ours, args=(p,))
     st.radio("Your verdict", list(VERDICTS), format_func=VERDICTS.get, index=None, horizontal=True, key=k_verdict(sid))
-    st.text_area("Your notes", key=k_notes(sid), height=110, max_chars=NOTE_MAX,
+    st.text_area("Your notes", key=k_notes(sid), height=110,
                  placeholder="What should we change or improve? What do you like?")
+    voice_button()
+    length_check(k_notes(sid), NOTE_MAX, "Your notes")
     st.divider()
+
+
+def too_long() -> list[str]:
+    """Scripts with a text box over its limit."""
+    out = []
+    for p in pk["scripts"]:
+        sid = p["id"]
+        boxes = [(k_hook(sid, h["k"]), HOOK_MAX) for h in p["hooks"]] + [(k_body(sid), TEXT_MAX), (k_notes(sid), NOTE_MAX)]
+        if any(len(st.session_state.get(k) or "") > limit for k, limit in boxes):
+            out.append(str(p["n"]))
+    return out
 
 
 def collect(status: str) -> dict:
@@ -307,6 +391,9 @@ def collect(status: str) -> dict:
 def save(status: str) -> bool:
     if time.time() - st.session_state.get("last_save", 0) < 5:
         st.warning("Saved a moment ago. Wait 5 seconds, then try again.")
+        return False
+    if long := too_long():
+        st.error(f"A text in script {', '.join(long)} is too long. Make it shorter (see the red message under it), then try again.")
         return False
     current = read(f"client_review/{cid}/{bid}/feedback_r{r}.json") or {}
     if current.get("status") == "sent":
@@ -337,5 +424,7 @@ if c2.button("Send feedback", type="primary", use_container_width=True):
     missing = [str(p["n"]) for p in pk["scripts"] if not st.session_state.get(k_verdict(p["id"]))]
     if missing:
         st.error(f"Pick a verdict for script {', '.join(missing)} first.")
+    elif long := too_long():
+        st.error(f"A text in script {', '.join(long)} is too long. Make it shorter (see the red message under it), then send.")
     else:
         confirm_send()
